@@ -110,7 +110,7 @@ def parse_args() -> ParsedArgs:
 
 def run_command(command: list[str], error_message: str) -> None:
     if subprocess.run(command, check=False).returncode != 0:
-        print(error_message, flush=True)
+        print(f"{error_message}: {' '.join(command)}", flush=True)
         sys.exit(1)
 
 
@@ -158,26 +158,29 @@ def normalize_frontend_revision(revision: Optional[str]) -> Optional[str]:
         return None
 
     normalized_revision = revision.strip().lower()
-    if REVISION_PATTERN.fullmatch(normalized_revision):
-        return normalized_revision
-    return None
+    return (
+        normalized_revision
+        if REVISION_PATTERN.fullmatch(normalized_revision)
+        else None
+    )
 
 
 def detect_frontend_revision(
     version_payload: dict[str, Any], requested_revision: Optional[str]
 ) -> str:
     normalized_requested_revision = normalize_frontend_revision(requested_revision)
-    if normalized_requested_revision:
-        print(
-            f"Using requested DevTools frontend revision {normalized_requested_revision}",
-            flush=True,
-        )
-        return normalized_requested_revision
     if requested_revision:
-        print(
-            f"[!] Ignoring invalid frontend revision {requested_revision!r}",
-            flush=True,
-        )
+        if normalized_requested_revision is None:
+            print(
+                f"[!] Ignoring invalid frontend revision {requested_revision!r}",
+                flush=True,
+            )
+        else:
+            print(
+                f"Using requested DevTools frontend revision {normalized_requested_revision}",
+                flush=True,
+            )
+            return normalized_requested_revision
 
     webkit_version = str(version_payload.get("WebKit-Version", ""))
     match = re.search(r"@([0-9a-fA-F]{40})", webkit_version)
@@ -203,7 +206,11 @@ def detect_frontend_revision(
 async def resolve_runtime_config(args: ParsedArgs) -> RuntimeConfig:
     try:
         version_payload = await fetch_remote_json("/json/version")
-    except Exception as error:
+    except (
+        aiohttp.ClientError,
+        asyncio.TimeoutError,
+        json.JSONDecodeError,
+    ) as error:
         print(
             f"[!] Failed to fetch browser version metadata: {error}. "
             f"Falling back to {DEFAULT_FRONTEND_FALLBACK_REVISION}",
@@ -348,9 +355,10 @@ async def open_tab(config: RuntimeConfig) -> None:
 
         print("Available targets:", flush=True)
         for index, target in enumerate(targets, start=1):
-            title = target.get("title") or target.get("description") or target["id"]
+            target_id = target.get("id", "unknown")
+            title = target.get("title") or target.get("description") or target_id
             print(
-                f"[{index}] ({target.get('type', 'page')}) {title} [{target['id']}]",
+                f"[{index}] ({target.get('type', 'page')}) {title} [{target_id}]",
                 flush=True,
             )
 
@@ -381,7 +389,10 @@ async def open_tab(config: RuntimeConfig) -> None:
             print("[!] Selected target is missing a frontend URL", flush=True)
             continue
 
-        print(f"Opening DevTools for {selected_target['id']}", flush=True)
+        print(
+            f"Opening DevTools for {selected_target.get('id', 'unknown')}",
+            flush=True,
+        )
         subprocess.run(["termux-open-url", frontend_url], check=False)
 
 
@@ -457,10 +468,13 @@ async def forward_websocket_messages(
             await destination.close()
             break
         elif msg.type == WSMsgType.ERROR:
+            print(f"[!] WebSocket error: {msg.data}", flush=True)
             break
 
 
 async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
+    # DevTools protocol traffic can include large payloads such as traces and
+    # source maps, so the proxy intentionally removes the default message limit.
     ws_server = web.WebSocketResponse(max_msg_size=0)
     await ws_server.prepare(request)
 
