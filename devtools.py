@@ -23,6 +23,7 @@ DEFAULT_FRONTEND_FALLBACK_REVISION = "f84901f7f0a12725375071f589e8d9fc61af1de3"
 DEFAULT_FRONTEND_URL_TEMPLATE = (
     "{base_url}/serve_rev/@{revision}/{entrypoint}?ws={ws}"
 )
+REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 HOP_BY_HOP_HEADERS = {
     "connection",
     "content-length",
@@ -150,19 +151,44 @@ async def fetch_remote_json(path: str) -> Any:
             return await resp.json()
 
 
+def normalize_frontend_revision(revision: Optional[str]) -> Optional[str]:
+    if not revision:
+        return None
+
+    normalized_revision = revision.strip().lower()
+    if REVISION_PATTERN.fullmatch(normalized_revision):
+        return normalized_revision
+    return None
+
+
 def detect_frontend_revision(
     version_payload: dict[str, Any], requested_revision: Optional[str]
 ) -> str:
+    normalized_requested_revision = normalize_frontend_revision(requested_revision)
+    if normalized_requested_revision:
+        print(
+            f"Using requested DevTools frontend revision {normalized_requested_revision}",
+            flush=True,
+        )
+        return normalized_requested_revision
     if requested_revision:
-        print(f"Using requested DevTools frontend revision {requested_revision}", flush=True)
-        return requested_revision
+        print(
+            f"[!] Ignoring invalid frontend revision {requested_revision!r}",
+            flush=True,
+        )
 
     webkit_version = str(version_payload.get("WebKit-Version", ""))
     match = re.search(r"@([0-9a-fA-F]{40})", webkit_version)
     if match:
-        revision = match.group(1).lower()
-        print(f"Detected DevTools frontend revision {revision}", flush=True)
-        return revision
+        revision = normalize_frontend_revision(match.group(1))
+        if revision is None:
+            print(
+                "[!] Ignoring invalid detected DevTools frontend revision",
+                flush=True,
+            )
+        else:
+            print(f"Detected DevTools frontend revision {revision}", flush=True)
+            return revision
 
     print(
         "[!] Failed to detect a matching DevTools frontend revision, "
@@ -209,6 +235,13 @@ def local_websocket_url(websocket_path: str) -> str:
 
 def local_websocket_query_value(websocket_path: str) -> str:
     return f"localhost:{LOCAL_PROXY_PORT}{websocket_path}"
+
+
+def extract_target_id(websocket_path: str, default_target_id: str) -> str:
+    path_parts = [part for part in websocket_path.split("/") if part]
+    if len(path_parts) >= 3:
+        return path_parts[-1]
+    return default_target_id
 
 
 def build_frontend_url(config: RuntimeConfig, websocket_path: str) -> str:
@@ -279,7 +312,7 @@ async def fetch_debug_targets(config: RuntimeConfig) -> list[dict[str, Any]]:
     if browser_websocket_path:
         targets.append(
             {
-                "id": browser_websocket_path.rsplit("/", 1)[-1],
+                "id": extract_target_id(browser_websocket_path, "browser"),
                 "title": version_payload.get("Browser", "Chrome browser target"),
                 "type": "browser",
                 "webSocketDebuggerUrl": local_websocket_url(browser_websocket_path),
@@ -365,7 +398,9 @@ async def cors_middleware(request: web.Request, handler: Any) -> web.StreamRespo
 
 async def proxy_http_handler(request: web.Request) -> web.Response:
     request_headers = {
-        key: value for key, value in request.headers.items() if key.lower() != "host"
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() != "host" and key.lower() not in HOP_BY_HOP_HEADERS
     }
     request_body = await request.read()
 
@@ -384,10 +419,11 @@ async def proxy_http_handler(request: web.Request) -> web.Response:
             }
             response_body = await resp.read()
             response_status = resp.status
+            response_charset = resp.charset or "utf-8"
 
     if request.path.startswith("/json"):
         try:
-            payload = json.loads(response_body.decode("utf-8"))
+            payload = json.loads(response_body.decode(response_charset))
             payload = rewrite_discovery_payload(
                 payload, request.path, request.app["config"]
             )
@@ -403,6 +439,19 @@ async def proxy_http_handler(request: web.Request) -> web.Response:
     )
 
 
+async def forward_websocket_messages(source: Any, destination: Any) -> None:
+    async for msg in source:
+        if msg.type == WSMsgType.TEXT:
+            await destination.send_str(msg.data)
+        elif msg.type == WSMsgType.BINARY:
+            await destination.send_bytes(msg.data)
+        elif msg.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}:
+            await destination.close()
+            break
+        elif msg.type == WSMsgType.ERROR:
+            break
+
+
 async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
     ws_server = web.WebSocketResponse(max_msg_size=0)
     await ws_server.prepare(request)
@@ -413,34 +462,9 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
                 f"ws://localhost:{REMOTE_DEVTOOLS_PORT}{request.path_qs}",
                 max_msg_size=0,
             ) as ws_client:
-
-                async def forward_server_to_client() -> None:
-                    async for msg in ws_server:
-                        if msg.type == WSMsgType.TEXT:
-                            await ws_client.send_str(msg.data)
-                        elif msg.type == WSMsgType.BINARY:
-                            await ws_client.send_bytes(msg.data)
-                        elif msg.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}:
-                            await ws_client.close()
-                            break
-                        elif msg.type == WSMsgType.ERROR:
-                            break
-
-                async def forward_client_to_server() -> None:
-                    async for msg in ws_client:
-                        if msg.type == WSMsgType.TEXT:
-                            await ws_server.send_str(msg.data)
-                        elif msg.type == WSMsgType.BINARY:
-                            await ws_server.send_bytes(msg.data)
-                        elif msg.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}:
-                            await ws_server.close()
-                            break
-                        elif msg.type == WSMsgType.ERROR:
-                            break
-
                 await asyncio.gather(
-                    forward_server_to_client(),
-                    forward_client_to_server(),
+                    forward_websocket_messages(ws_server, ws_client),
+                    forward_websocket_messages(ws_client, ws_server),
                 )
     except aiohttp.ClientError as error:
         print(f"[!] WebSocket proxy failure for {request.path}: {error}", flush=True)
