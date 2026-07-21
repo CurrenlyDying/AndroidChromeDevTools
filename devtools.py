@@ -8,7 +8,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import urlparse
 
 import aiohttp
@@ -23,6 +23,8 @@ DEFAULT_FRONTEND_FALLBACK_REVISION = "f84901f7f0a12725375071f589e8d9fc61af1de3"
 DEFAULT_FRONTEND_URL_TEMPLATE = (
     "{base_url}/serve_rev/@{revision}/{entrypoint}?ws={ws}"
 )
+EXPECTED_DEVTOOLS_TARGET_PATH_SEGMENTS = 3
+CORS_ALLOW_ORIGIN = "*"
 REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -239,7 +241,7 @@ def local_websocket_query_value(websocket_path: str) -> str:
 
 def extract_target_id(websocket_path: str, default_target_id: str) -> str:
     path_parts = [part for part in websocket_path.split("/") if part]
-    if len(path_parts) >= 3:
+    if len(path_parts) >= EXPECTED_DEVTOOLS_TARGET_PATH_SEGMENTS:
         return path_parts[-1]
     return default_target_id
 
@@ -384,13 +386,16 @@ async def open_tab(config: RuntimeConfig) -> None:
 
 
 @middleware
-async def cors_middleware(request: web.Request, handler: Any) -> web.StreamResponse:
+async def cors_middleware(
+    request: web.Request,
+    handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
+) -> web.StreamResponse:
     if request.method == "OPTIONS":
         response = web.Response(status=204)
     else:
         response = await handler(request)
 
-    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Origin"] = CORS_ALLOW_ORIGIN
     response.headers["Access-Control-Allow-Headers"] = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
     return response
@@ -439,7 +444,10 @@ async def proxy_http_handler(request: web.Request) -> web.Response:
     )
 
 
-async def forward_websocket_messages(source: Any, destination: Any) -> None:
+async def forward_websocket_messages(
+    source: web.WebSocketResponse | aiohttp.ClientWebSocketResponse,
+    destination: web.WebSocketResponse | aiohttp.ClientWebSocketResponse,
+) -> None:
     async for msg in source:
         if msg.type == WSMsgType.TEXT:
             await destination.send_str(msg.data)

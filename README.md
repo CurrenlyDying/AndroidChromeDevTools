@@ -98,6 +98,8 @@ The local proxy listens on `localhost:9223` and now exposes more of the standard
 
 Discovery responses are rewritten to point back to the local proxy and to the selected DevTools frontend, which improves compatibility with newer DevTools features and external tooling that expects the normal discovery endpoints.
 
+The proxy is bound to `localhost` and uses permissive CORS headers so that hosted or self-hosted DevTools frontends can connect back to it.
+
 When prompted, you can now enter either the numbered target from the list or the raw target ID.
 
 ### AI DevTools and MCP limitations
